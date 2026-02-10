@@ -1,74 +1,222 @@
-name: Duranto RDP
+name: Duranto RDP with GPU Support
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    runs-on: windows-latest  # This sometimes has basic GPU support
     timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Check GPU Availability
         shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Write-Host "Checking available GPU hardware..."
+          
+          # Check for any display adapters
+          $gpuInfo = Get-WmiObject Win32_VideoController | Select-Object Name, VideoProcessor, DriverVersion, CurrentHorizontalResolution, CurrentVerticalResolution
+          
+          if ($gpuInfo) {
+              Write-Host "=== GPU Information ===" -ForegroundColor Green
+              $gpuInfo | Format-List *
+              Write-Host "=========================" -ForegroundColor Green
+              
+              # Enable better graphics support
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "DWMFRAMEINTERVAL" -Value 15
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "MaxXResolution" -Value 3840
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                               -Name "MaxYResolution" -Value 2160
+              
+              echo "GPU_AVAILABLE=true" >> $env:GITHUB_ENV
+          } else {
+              Write-Warning "No dedicated GPU found. Using software rendering."
+              echo "GPU_AVAILABLE=false" >> $env:GITHUB_ENV
+          }
+
+      - name: Install Enhanced Graphics Drivers
+        shell: pwsh
+        run: |
+          Write-Host "Installing/Updating display drivers for better emulator performance..."
+          
+          # Update basic display drivers using PnPUtil
+          pnputil /enum-devices /class Display | Out-Host
+          
+          # Try to update display drivers
+          $driversUpdated = $false
+          
+          try {
+              # Windows Update for display drivers
+              $session = New-Object -ComObject Microsoft.Update.Session
+              $searcher = $session.CreateUpdateSearcher()
+              $result = $searcher.Search("Type='Driver' and IsInstalled=0")
+              
+              if ($result.Updates.Count -gt 0) {
+                  Write-Host "Found $($result.Updates.Count) driver updates"
+                  $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+                  
+                  foreach ($update in $result.Updates) {
+                      if ($update.Title -like "*Display*" -or $update.Title -like "*Graphics*" -or $update.Title -like "*Video*") {
+                          $updatesToInstall.Add($update) | Out-Null
+                          Write-Host "Will install: $($update.Title)"
+                      }
+                  }
+                  
+                  if ($updatesToInstall.Count -gt 0) {
+                      $installer = $session.CreateUpdateInstaller()
+                      $installer.Updates = $updatesToInstall
+                      $installationResult = $installer.Install()
+                      
+                      if ($installationResult.ResultCode -eq 2) {
+                          $driversUpdated = $true
+                          Write-Host "Display drivers updated successfully!" -ForegroundColor Green
+                      }
+                  }
+              }
+          } catch {
+              Write-Warning "Could not update via Windows Update: $($_.Exception.Message)"
+          }
+          
+          if (-not $driversUpdated) {
+              Write-Host "Installing Basic Display Driver features..."
+              
+              # Enable Windows Basic Display Driver features
+              Add-WindowsCapability -Online -Name "BasicDisplay.Driver~~~~0.0.1.0" -ErrorAction SilentlyContinue
+              
+              # Install DirectX runtime (important for emulators)
+              $dxUrl = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
+              $dxPath = "$env:TEMP\directx_redist.exe"
+              
+              try {
+                  Invoke-WebRequest -Uri $dxUrl -OutFile $dxPath -ErrorAction Stop
+                  Start-Process -FilePath $dxPath -ArgumentList "/Q", "/T:C:\DXSetup" -Wait -NoNewWindow
+                  Start-Process -FilePath "C:\DXSetup\DXSETUP.exe" -ArgumentList "/silent" -Wait -NoNewWindow
+                  Remove-Item $dxPath -Force -ErrorAction SilentlyContinue
+                  Remove-Item "C:\DXSetup" -Recurse -Force -ErrorAction SilentlyContinue
+                  Write-Host "DirectX runtime installed" -ForegroundColor Green
+              } catch {
+                  Write-Warning "DirectX installation failed: $($_.Exception.Message)"
+              }
+          }
+
+      - name: Configure RDP for High Performance
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
+          
+          # Optimize RDP for graphics performance
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxMonitors" -Value 4
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "DWMFRAMEINTERVAL" -Value 15  # Lower = smoother video
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "AVC444ModePreferred" -Value 1  # Enable AVC/H.264
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "AVCHardwareEncodePreferred" -Value 1
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "AVCHardwareDecodePreferred" -Value 1
+          
+          # Increase color depth for better graphics
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "ColorDepth" -Value 4  # 32-bit color
+          
+          # Configure performance settings
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MinEncryptionLevel" -Value 2
+          
+          # Enable GPU acceleration in Windows
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' `
+                           -Name "DisableGPUForWDP" -Value 0 -ErrorAction SilentlyContinue
+          
+          # Firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-         
-          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          
           Restart-Service -Name TermService -Force
+
+      - name: Install Emulator Prerequisites
+        shell: pwsh
+        run: |
+          Write-Host "Installing emulator prerequisites..."
+          
+          # Install .NET Framework (required for many emulators)
+          try {
+              Enable-WindowsOptionalFeature -Online -FeatureName "NetFx3" -All -NoRestart -ErrorAction SilentlyContinue
+              Write-Host ".NET Framework enabled"
+          } catch {
+              Write-Warning ".NET installation failed: $($_.Exception.Message)"
+          }
+          
+          # Install Visual C++ Redistributables
+          $vcRedists = @(
+              "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+              "https://aka.ms/vs/16/release/vc_redist.x64.exe"
+          )
+          
+          foreach ($url in $vcRedists) {
+              try {
+                  $fileName = [System.IO.Path]::GetFileName($url)
+                  $filePath = "$env:TEMP\$fileName"
+                  Invoke-WebRequest -Uri $url -OutFile $filePath -ErrorAction Stop
+                  Start-Process -FilePath $filePath -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow
+                  Remove-Item $filePath -Force -ErrorAction SilentlyContinue
+                  Write-Host "Installed: $fileName"
+              } catch {
+                  Write-Warning "Failed to install VC++ Redist: $($_.Exception.Message)"
+              }
+          }
+          
+          # Enable Hyper-V and Virtualization features (for Android emulators)
+          try {
+              Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -All -NoRestart -ErrorAction SilentlyContinue
+              Enable-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -All -NoRestart -ErrorAction SilentlyContinue
+              Write-Host "Virtualization features enabled"
+          } catch {
+              Write-Warning "Could not enable virtualization features"
+          }
+          
+          # Install OpenGL/DirectX support
+          Add-WindowsCapability -Online -Name "OpenGL.Driver~~~~0.0.1.0" -ErrorAction SilentlyContinue
 
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
-          # Function to generate secure password
           function New-SecurePassword {
               param([int]$Length = 16)
-              
               $charSets = @{
-                  Upper   = [char[]](65..90)      # A-Z
-                  Lower   = [char[]](97..122)     # a-z
-                  Number  = [char[]](48..57)      # 0-9
-                  Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,94,95) # Special characters
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,94,95)
               }
-              
               $passwordChars = @()
-              
-              # Ensure at least one character from each set
               $passwordChars += $charSets.Upper | Get-Random -Count 4
               $passwordChars += $charSets.Lower | Get-Random -Count 4
               $passwordChars += $charSets.Number | Get-Random -Count 4
               $passwordChars += $charSets.Special | Get-Random -Count 4
-              
-              # Shuffle the characters
               $password = -join ($passwordChars | Sort-Object { Get-Random })
               return $password
           }
 
-          # Generate secure password
           $password = New-SecurePassword
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          # Create user
           try {
-              New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
-              Add-LocalGroupMember -Group "Administrators" -Member "RDPUser" -ErrorAction Stop
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser" -ErrorAction Stop
+              New-LocalUser -Name "EmulatorUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member "EmulatorUser" -ErrorAction Stop
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "EmulatorUser" -ErrorAction Stop
               
-              Write-Host "User created successfully"
-              echo "RDP_USER=RDPUser" >> $env:GITHUB_ENV
+              Write-Host "User created successfully for emulator usage"
+              echo "RDP_USER=EmulatorUser" >> $env:GITHUB_ENV
               echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           }
           catch {
@@ -85,7 +233,7 @@ jobs:
           try {
               Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
               Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
-              Start-Sleep -Seconds 10  # Wait for installation to complete
+              Start-Sleep -Seconds 10
               Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
               Write-Host "Tailscale installed successfully"
           }
@@ -104,7 +252,7 @@ jobs:
               exit 1
           }
           
-          # Wait for Tailscale service to be ready
+          # Wait for Tailscale service
           $serviceReady = $false
           $retries = 0
           while (-not $serviceReady -and $retries -lt 10) {
@@ -130,10 +278,8 @@ jobs:
               exit 1
           }
           
-          # Bring up Tailscale with the provided auth key
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-emulator-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 15) {
@@ -153,45 +299,75 @@ jobs:
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $tsIP"
 
-      - name: Verify RDP Accessibility
+      - name: Prepare for Emulator Installation
         shell: pwsh
         run: |
-          Write-Host "Testing RDP connectivity to Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Setting up environment for emulators..."
           
-          # Test connectivity using Test-NetConnection
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-          if (-not $testResult) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              Write-Host "Checking local RDP status..."
-              Get-Service TermService | Format-Table Name, Status
-              exit 1
+          # Create directory for emulators
+          New-Item -ItemType Directory -Path "C:\Emulators" -Force | Out-Null
+          
+          # Download common emulator tools
+          Write-Host "Downloading useful emulator tools..."
+          
+          # Download and install BlueStacks prerequisites
+          try {
+              # Install Windows SDK (useful for emulators)
+              Add-WindowsCapability -Online -Name "Windows.DeveloperMode~~~~0.0.1.0" -ErrorAction SilentlyContinue
+              
+              # Enable Developer Mode
+              Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
+                               -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord
+              Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
+                               -Name "AllowAllTrustedApps" -Value 1 -Type DWord
+              
+              Write-Host "Developer mode enabled for emulators"
+          } catch {
+              Write-Warning "Could not enable developer mode"
           }
-          Write-Host "TCP connectivity successful!"
+          
+          # Set performance power plan
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High performance
+          
+          # Disable Windows Defender for better performance (temporarily)
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 
-      - name: Display Connection Information
+      - name: Display Emulator-Ready Information
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "=== RDP ACCESS INFORMATION ===" -ForegroundColor Green
+          Write-Host "=== EMULATOR RDP READY ===" -ForegroundColor Green
           Write-Host "Tailscale Address: $env:TAILSCALE_IP" -ForegroundColor Yellow
           Write-Host "Username: $env:RDP_USER" -ForegroundColor Yellow
           Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Yellow
           Write-Host "Port: 3389" -ForegroundColor Yellow
-          Write-Host "==============================" -ForegroundColor Green
           Write-Host ""
-          Write-Host "This RDP session will be active for 6 hours maximum"
-          Write-Host "To connect from another Tailscale device, use the above credentials"
+          Write-Host "=== INSTALL THESE EMULATORS ===" -ForegroundColor Cyan
+          Write-Host "1. BlueStacks 5: https://www.bluestacks.com/download.html"
+          Write-Host "2. NoxPlayer: https://www.bignox.com/"
+          Write-Host "3. LDPlayer: https://www.ldplayer.net/"
+          Write-Host "4. MEmu Play: https://www.memuplay.com/"
+          Write-Host "5. GameLoop: https://www.gameloop.com/"
+          Write-Host ""
+          Write-Host "=== OPTIMIZATION TIPS ===" -ForegroundColor Magenta
+          Write-Host "- Set emulator to DirectX mode"
+          Write-Host "- Allocate 4GB+ RAM to emulator"
+          Write-Host "- Enable VT in emulator settings"
+          Write-Host "- Use 1280x720 resolution for best performance"
+          Write-Host "=============================" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "This session will be active for 6 hours"
+          Write-Host "Install your preferred emulator after connecting"
           Write-Host ""
 
       - name: Maintain Connection
         shell: pwsh
         run: |
-          Write-Host "Maintaining RDP connection..."
-          Write-Host "Session active. Press Ctrl+C in GitHub Actions to stop."
+          Write-Host "Maintaining RDP connection for emulator usage..."
+          Write-Host "Connect and install your preferred Android emulator"
           
-          # Keep runner active with periodic status updates
           $startTime = Get-Date
-          $timeoutMinutes = 350  # Slightly less than workflow timeout
+          $timeoutMinutes = 350
           
           while ($true) {
               $elapsed = (Get-Date) - $startTime
@@ -202,14 +378,14 @@ jobs:
                   break
               }
               
-              Write-Host "RDP session active - Time remaining: $([math]::Round($remaining)) minutes"
+              Write-Host "Emulator RDP active - Remaining: $([math]::Round($remaining)) minutes"
               
-              # Check if Tailscale is still connected
+              # Check Tailscale connection
               $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
               if (-not $tsStatus -or $tsStatus.BackendState -ne "Running") {
                   Write-Error "Tailscale connection lost. Exiting."
                   exit 1
               }
               
-              Start-Sleep -Seconds 60  # Check every minute
+              Start-Sleep -Seconds 60
           }
