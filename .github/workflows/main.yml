@@ -1,391 +1,473 @@
-name: Duranto RDP with GPU Support
+name: Android Emulator on GitHub via Tailscale RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      emulator_type:
+        description: 'Select Emulator Type'
+        required: true
+        default: 'Android Studio'
+        type: choice
+        options:
+        - 'Android Studio'
+        - 'BlueStacks'
+        - 'LDPlayer'
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest  # This sometimes has basic GPU support
+  android-emulator-rdp:
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Check GPU Availability
-        shell: pwsh
-        run: |
-          Write-Host "Checking available GPU hardware..."
-          
-          # Check for any display adapters
-          $gpuInfo = Get-WmiObject Win32_VideoController | Select-Object Name, VideoProcessor, DriverVersion, CurrentHorizontalResolution, CurrentVerticalResolution
-          
-          if ($gpuInfo) {
-              Write-Host "=== GPU Information ===" -ForegroundColor Green
-              $gpuInfo | Format-List *
-              Write-Host "=========================" -ForegroundColor Green
-              
-              # Enable better graphics support
-              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                               -Name "DWMFRAMEINTERVAL" -Value 15
-              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                               -Name "MaxXResolution" -Value 3840
-              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                               -Name "MaxYResolution" -Value 2160
-              
-              echo "GPU_AVAILABLE=true" >> $env:GITHUB_ENV
-          } else {
-              Write-Warning "No dedicated GPU found. Using software rendering."
-              echo "GPU_AVAILABLE=false" >> $env:GITHUB_ENV
-          }
+    - name: Configure RDP for Tailscale Access
+      shell: powershell
+      run: |
+        Write-Host "🔧 Configuring RDP for Tailscale..."
+        
+        # Enable RDP
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                         -Name "fDenyTSConnections" -Value 0 -Force
+        
+        # Disable NLA for Tailscale compatibility
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                         -Name "UserAuthentication" -Value 0 -Force
+        
+        # Configure for better performance
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                         -Name "MaxMonitors" -Value 4
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                         -Name "DWMFRAMEINTERVAL" -Value 15
+        
+        # Firewall rule for RDP
+        netsh advfirewall firewall add rule name="Tailscale-RDP" dir=in action=allow protocol=TCP localport=3389
+        
+        # Restart service
+        Restart-Service TermService -Force
+        
+        Write-Host "✅ RDP configured for Tailscale"
 
-      - name: Install Enhanced Graphics Drivers
-        shell: pwsh
-        run: |
-          Write-Host "Installing/Updating display drivers for better emulator performance..."
-          
-          # Update basic display drivers using PnPUtil
-          pnputil /enum-devices /class Display | Out-Host
-          
-          # Try to update display drivers
-          $driversUpdated = $false
-          
-          try {
-              # Windows Update for display drivers
-              $session = New-Object -ComObject Microsoft.Update.Session
-              $searcher = $session.CreateUpdateSearcher()
-              $result = $searcher.Search("Type='Driver' and IsInstalled=0")
-              
-              if ($result.Updates.Count -gt 0) {
-                  Write-Host "Found $($result.Updates.Count) driver updates"
-                  $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-                  
-                  foreach ($update in $result.Updates) {
-                      if ($update.Title -like "*Display*" -or $update.Title -like "*Graphics*" -or $update.Title -like "*Video*") {
-                          $updatesToInstall.Add($update) | Out-Null
-                          Write-Host "Will install: $($update.Title)"
-                      }
-                  }
-                  
-                  if ($updatesToInstall.Count -gt 0) {
-                      $installer = $session.CreateUpdateInstaller()
-                      $installer.Updates = $updatesToInstall
-                      $installationResult = $installer.Install()
-                      
-                      if ($installationResult.ResultCode -eq 2) {
-                          $driversUpdated = $true
-                          Write-Host "Display drivers updated successfully!" -ForegroundColor Green
-                      }
-                  }
-              }
-          } catch {
-              Write-Warning "Could not update via Windows Update: $($_.Exception.Message)"
-          }
-          
-          if (-not $driversUpdated) {
-              Write-Host "Installing Basic Display Driver features..."
-              
-              # Enable Windows Basic Display Driver features
-              Add-WindowsCapability -Online -Name "BasicDisplay.Driver~~~~0.0.1.0" -ErrorAction SilentlyContinue
-              
-              # Install DirectX runtime (important for emulators)
-              $dxUrl = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
-              $dxPath = "$env:TEMP\directx_redist.exe"
-              
-              try {
-                  Invoke-WebRequest -Uri $dxUrl -OutFile $dxPath -ErrorAction Stop
-                  Start-Process -FilePath $dxPath -ArgumentList "/Q", "/T:C:\DXSetup" -Wait -NoNewWindow
-                  Start-Process -FilePath "C:\DXSetup\DXSETUP.exe" -ArgumentList "/silent" -Wait -NoNewWindow
-                  Remove-Item $dxPath -Force -ErrorAction SilentlyContinue
-                  Remove-Item "C:\DXSetup" -Recurse -Force -ErrorAction SilentlyContinue
-                  Write-Host "DirectX runtime installed" -ForegroundColor Green
-              } catch {
-                  Write-Warning "DirectX installation failed: $($_.Exception.Message)"
-              }
-          }
+    - name: Create RDP User
+      shell: powershell
+      run: |
+        Write-Host "👤 Creating RDP user..."
+        
+        # Generate secure password
+        Add-Type -AssemblyName System.Web
+        $password = [System.Web.Security.Membership]::GeneratePassword(12, 3)
+        
+        # Create user
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+        New-LocalUser -Name "AndroidUser" -Password $securePass -AccountNeverExpires
+        Add-LocalGroupMember -Group "Administrators" -Member "AndroidUser"
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "AndroidUser"
+        
+        # Save credentials
+        echo "RDP_USER=AndroidUser" >> $env:GITHUB_ENV
+        echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+        
+        Write-Host "✅ User created"
 
-      - name: Configure RDP for High Performance
-        shell: pwsh
-        run: |
-          # Enable Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
-          
-          # Optimize RDP for graphics performance
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "MaxMonitors" -Value 4
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "DWMFRAMEINTERVAL" -Value 15  # Lower = smoother video
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "AVC444ModePreferred" -Value 1  # Enable AVC/H.264
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "AVCHardwareEncodePreferred" -Value 1
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "AVCHardwareDecodePreferred" -Value 1
-          
-          # Increase color depth for better graphics
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "ColorDepth" -Value 4  # 32-bit color
-          
-          # Configure performance settings
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "MinEncryptionLevel" -Value 2
-          
-          # Enable GPU acceleration in Windows
-          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' `
-                           -Name "DisableGPUForWDP" -Value 0 -ErrorAction SilentlyContinue
-          
-          # Firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          
-          Restart-Service -Name TermService -Force
+    - name: Install Tailscale VPN
+      shell: powershell
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        Write-Host "🔗 Installing Tailscale VPN..."
+        
+        if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "❌ Tailscale auth key not found in secrets"
+            exit 1
+        }
+        
+        # Download and install Tailscale
+        $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+        $tsPath = "$env:TEMP\tailscale.msi"
+        
+        Invoke-WebRequest -Uri $tsUrl -OutFile $tsPath -ErrorAction Stop
+        Start-Process msiexec.exe -ArgumentList "/i", "`"$tsPath`"", "/quiet", "/norestart" -Wait
+        
+        # Wait for service to start
+        Start-Sleep -Seconds 15
+        
+        # Start Tailscale service if not running
+        $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+        if ($service.Status -ne "Running") {
+            Start-Service -Name "Tailscale"
+            Start-Sleep -Seconds 5
+        }
+        
+        # Connect to Tailscale network
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname="github-android-$env:GITHUB_RUN_ID" --accept-dns=false
+        
+        # Get Tailscale IP
+        $tsIP = $null
+        $maxRetries = 20
+        
+        for ($i = 1; $i -le $maxRetries; $i++) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+            if ($tsIP) {
+                break
+            }
+            Write-Host "⏳ Waiting for Tailscale IP... ($i/$maxRetries)"
+            Start-Sleep -Seconds 5
+        }
+        
+        if (-not $tsIP) {
+            # Try alternative method
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json | Select-Object -ExpandProperty TailscaleIPs | Select-Object -First 1
+        }
+        
+        if (-not $tsIP) {
+            Write-Error "❌ Failed to get Tailscale IP"
+            exit 1
+        }
+        
+        echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+        Write-Host "✅ Tailscale connected: $tsIP"
 
-      - name: Install Emulator Prerequisites
-        shell: pwsh
-        run: |
-          Write-Host "Installing emulator prerequisites..."
-          
-          # Install .NET Framework (required for many emulators)
-          try {
-              Enable-WindowsOptionalFeature -Online -FeatureName "NetFx3" -All -NoRestart -ErrorAction SilentlyContinue
-              Write-Host ".NET Framework enabled"
-          } catch {
-              Write-Warning ".NET installation failed: $($_.Exception.Message)"
-          }
-          
-          # Install Visual C++ Redistributables
-          $vcRedists = @(
-              "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-              "https://aka.ms/vs/16/release/vc_redist.x64.exe"
-          )
-          
-          foreach ($url in $vcRedists) {
-              try {
-                  $fileName = [System.IO.Path]::GetFileName($url)
-                  $filePath = "$env:TEMP\$fileName"
-                  Invoke-WebRequest -Uri $url -OutFile $filePath -ErrorAction Stop
-                  Start-Process -FilePath $filePath -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow
-                  Remove-Item $filePath -Force -ErrorAction SilentlyContinue
-                  Write-Host "Installed: $fileName"
-              } catch {
-                  Write-Warning "Failed to install VC++ Redist: $($_.Exception.Message)"
-              }
-          }
-          
-          # Enable Hyper-V and Virtualization features (for Android emulators)
-          try {
-              Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -All -NoRestart -ErrorAction SilentlyContinue
-              Enable-WindowsOptionalFeature -Online -FeatureName "VirtualMachinePlatform" -All -NoRestart -ErrorAction SilentlyContinue
-              Write-Host "Virtualization features enabled"
-          } catch {
-              Write-Warning "Could not enable virtualization features"
-          }
-          
-          # Install OpenGL/DirectX support
-          Add-WindowsCapability -Online -Name "OpenGL.Driver~~~~0.0.1.0" -ErrorAction SilentlyContinue
+    - name: Install Android Studio Emulator
+      shell: powershell
+      if: github.event.inputs.emulator_type == 'Android Studio'
+      run: |
+        Write-Host "📱 Installing Android Studio Emulator..."
+        
+        # Download Android Studio
+        $asUrl = "https://redirector.gvt1.com/edgedl/android/studio/ide-zips/2023.1.1.27/android-studio-2023.1.1.27-windows.exe"
+        $asPath = "$env:TEMP\android-studio.exe"
+        
+        Invoke-WebRequest -Uri $asUrl -OutFile $asPath -ErrorAction Stop
+        
+        # Create silent install config
+        $installConfig = @"
+mode=user
+# Installation path
+installation.path=C:\\Android\\AndroidStudio
+# Create desktop shortcuts
+create.desktop.icon=1
+# Create start menu shortcuts
+create.start.menu.icon=1
+# Install Android SDK
+install.android.sdk=1
+# SDK installation path
+sdk.path=C:\\Android\\sdk
+# Do not run Android Studio after installation
+run.android.studio=0
+"@
+        
+        $installConfig | Out-File -FilePath "$env:TEMP\studio.install.cfg" -Encoding ASCII
+        
+        # Install Android Studio silently
+        Start-Process -FilePath $asPath -ArgumentList "/S", "/CONFIG=$env:TEMP\studio.install.cfg" -Wait
+        
+        # Set environment variables
+        [Environment]::SetEnvironmentVariable("ANDROID_HOME", "C:\Android\sdk", "Machine")
+        [Environment]::SetEnvironmentVariable("Path", "$env:Path;C:\Android\sdk\platform-tools;C:\Android\sdk\emulator", "Machine")
+        
+        # Accept SDK licenses
+        $licenseCmd = @'
+for /f "tokens=*" %%i in ('dir /b "%ANDROID_HOME%\licenses"') do (
+  echo y | "%ANDROID_HOME%\tools\bin\sdkmanager" --licenses
+)
+'@
+        
+        $licenseCmd | Out-File -FilePath "$env:TEMP\accept_licenses.bat" -Encoding ASCII
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "$env:TEMP\accept_licenses.bat" -Wait
+        
+        Write-Host "✅ Android Studio installed"
 
-      - name: Create RDP User with Secure Password
-        shell: pwsh
-        run: |
-          function New-SecurePassword {
-              param([int]$Length = 16)
-              $charSets = @{
-                  Upper   = [char[]](65..90)
-                  Lower   = [char[]](97..122)
-                  Number  = [char[]](48..57)
-                  Special = [char[]](33,35,36,37,38,42,43,45,61,63,64,94,95)
-              }
-              $passwordChars = @()
-              $passwordChars += $charSets.Upper | Get-Random -Count 4
-              $passwordChars += $charSets.Lower | Get-Random -Count 4
-              $passwordChars += $charSets.Number | Get-Random -Count 4
-              $passwordChars += $charSets.Special | Get-Random -Count 4
-              $password = -join ($passwordChars | Sort-Object { Get-Random })
-              return $password
-          }
+    - name: Install BlueStacks Emulator
+      shell: powershell
+      if: github.event.inputs.emulator_type == 'BlueStacks'
+      run: |
+        Write-Host "📱 Installing BlueStacks 5 (Nougat 32-bit for compatibility)..."
+        
+        # BlueStacks 5 Nougat 32-bit (most compatible)
+        $bsUrl = "https://cdn3.bluestacks.com/downloads/5.20.0.1041/BlueStacksInstaller_5.20.0.1041_amd64_native.exe"
+        $bsPath = "C:\BlueStacks5.exe"
+        
+        Invoke-WebRequest -Uri $bsUrl -OutFile $bsPath -ErrorAction Stop
+        
+        # Create installation script
+        $installScript = @"
+@echo off
+echo Installing BlueStacks 5...
+echo This may take several minutes...
+echo.
+start /wait "" "$bsPath" /S
+echo.
+echo Installation complete!
+echo.
+echo Configuration Instructions:
+echo 1. Open BlueStacks 5
+echo 2. Go to Settings > Engine
+echo 3. Set Graphics mode: DirectX
+echo 4. Set Performance mode: High performance
+echo 5. Set Resolution: 1280x720
+echo 6. Set CPU: 2 cores
+echo 7. Set RAM: 2048 MB
+echo.
+pause
+"@
+        
+        $installScript | Out-File -FilePath "C:\Install_BlueStacks.bat" -Encoding ASCII
+        Write-Host "✅ BlueStacks downloaded"
 
-          $password = New-SecurePassword
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          try {
-              New-LocalUser -Name "EmulatorUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
-              Add-LocalGroupMember -Group "Administrators" -Member "EmulatorUser" -ErrorAction Stop
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "EmulatorUser" -ErrorAction Stop
-              
-              Write-Host "User created successfully for emulator usage"
-              echo "RDP_USER=EmulatorUser" >> $env:GITHUB_ENV
-              echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          }
-          catch {
-              Write-Error "User creation failed: $($_.Exception.Message)"
-              exit 1
-          }
+    - name: Install LDPlayer
+      shell: powershell
+      if: github.event.inputs.emulator_type == 'LDPlayer'
+      run: |
+        Write-Host "📱 Installing LDPlayer 9..."
+        
+        # LDPlayer 9 (good performance on virtual machines)
+        $ldUrl = "https://www.ldplayer.net/download/ldinst_9.0.3011.exe"
+        $ldPath = "C:\LDPlayer.exe"
+        
+        Invoke-WebRequest -Uri $ldUrl -OutFile $ldPath -ErrorAction Stop
+        
+        # Create installation script
+        $installScript = @"
+@echo off
+echo Installing LDPlayer 9...
+echo Please wait...
+echo.
+start /wait "" "$ldPath" /S
+echo.
+echo Installation complete!
+echo.
+echo Recommended settings:
+echo 1. Open LDPlayer
+echo 2. Click Settings icon
+echo 3. Set Performance: High (2 cores, 2048MB)
+echo 4. Set Resolution: 1280x720 (DPI 240)
+echo 5. Set Frame rate: 30 FPS
+echo.
+pause
+"@
+        
+        $installScript | Out-File -FilePath "C:\Install_LDPlayer.bat" -Encoding ASCII
+        Write-Host "✅ LDPlayer downloaded"
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          try {
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
-              Start-Sleep -Seconds 10
-              Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-              Write-Host "Tailscale installed successfully"
-          }
-          catch {
-              Write-Error "Tailscale installation failed: $($_.Exception.Message)"
-              exit 1
-          }
+    - name: Install Essential Software
+      shell: powershell
+      run: |
+        Write-Host "📦 Installing essential software for emulators..."
+        
+        # Install .NET Framework 4.8
+        $dotnetUrl = "https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/9b7b8746971ed51a1770ae4293618187/ndp48-x86-x64-allos-enu.exe"
+        $dotnetPath = "$env:TEMP\dotnet48.exe"
+        Invoke-WebRequest -Uri $dotnetUrl -OutFile $dotnetPath
+        Start-Process -FilePath $dotnetPath -ArgumentList "/q", "/norestart" -Wait
+        
+        # Install Visual C++ Redistributables
+        $vcRedists = @(
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            "https://aka.ms/vs/16/release/vc_redist.x64.exe",
+            "https://aka.ms/vs/15/release/vc_redist.x64.exe"
+        )
+        
+        foreach ($url in $vcRedists) {
+            $vcPath = "$env:TEMP\vc_redist.exe"
+            Invoke-WebRequest -Uri $url -OutFile $vcPath
+            Start-Process -FilePath $vcPath -ArgumentList "/install", "/quiet", "/norestart" -Wait
+        }
+        
+        # Install DirectX
+        $dxUrl = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
+        $dxPath = "$env:TEMP\directx.exe"
+        Invoke-WebRequest -Uri $dxUrl -OutFile $dxPath
+        Start-Process -FilePath $dxPath -ArgumentList "/Q", "/T:C:\DXSetup" -Wait
+        Start-Process -FilePath "C:\DXSetup\DXSETUP.exe" -ArgumentList "/silent" -Wait
+        
+        # Create desktop shortcuts
+        $desktopPath = [Environment]::GetFolderPath("Desktop")
+        
+        # Shortcut for RDP info
+        $WScriptShell = New-Object -ComObject WScript.Shell
+        $shortcut = $WScriptShell.CreateShortcut("$desktopPath\RDP Connection Info.lnk")
+        $shortcut.TargetPath = "notepad.exe"
+        $shortcut.Arguments = "C:\RDP_Info.txt"
+        $shortcut.Description = "RDP Connection Details"
+        $shortcut.Save()
+        
+        # Create a batch file to install emulator
+        $batchContent = @"
+@echo off
+title Install Android Emulator
+echo.
+echo Select emulator to install:
+echo.
+echo 1. Android Studio Emulator
+echo 2. BlueStacks 5
+echo 3. LDPlayer 9
+echo.
+set /p choice="Enter choice (1-3): "
+echo.
+if "%choice%"=="1" (
+    echo Installing Android Studio...
+    start /wait "" "C:\Android\AndroidStudio\bin\studio64.exe"
+) else if "%choice%"=="2" (
+    echo Installing BlueStacks 5...
+    call "C:\Install_BlueStacks.bat"
+) else if "%choice%"=="3" (
+    echo Installing LDPlayer 9...
+    call "C:\Install_LDPlayer.bat"
+) else (
+    echo Invalid choice
+)
+echo.
+pause
+"@
+        
+        $batchContent | Out-File -FilePath "C:\Install_Emulator.bat" -Encoding ASCII
+        
+        # Create shortcut for emulator installer
+        $shortcut2 = $WScriptShell.CreateShortcut("$desktopPath\Install Android Emulator.lnk")
+        $shortcut2.TargetPath = "C:\Install_Emulator.bat"
+        $shortcut2.Description = "Install Android Emulator"
+        $shortcut2.Save()
+        
+        Write-Host "✅ Essential software installed"
 
-      - name: Establish Tailscale Connection
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "Tailscale auth key not found in secrets"
-              exit 1
-          }
-          
-          # Wait for Tailscale service
-          $serviceReady = $false
-          $retries = 0
-          while (-not $serviceReady -and $retries -lt 10) {
-              try {
-                  $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-                  if ($service -and $service.Status -eq "Running") {
-                      $serviceReady = $true
-                      Write-Host "Tailscale service is running"
-                  } else {
-                      Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-                      Start-Sleep -Seconds 5
-                      $retries++
-                  }
-              }
-              catch {
-                  Start-Sleep -Seconds 5
-                  $retries++
-              }
-          }
-          
-          if (-not $serviceReady) {
-              Write-Error "Tailscale service not ready after $retries attempts"
-              exit 1
-          }
-          
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-emulator-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
-          
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-              if (-not $tsIP) {
-                  Write-Host "Waiting for Tailscale IP... ($retries/15)"
-                  Start-Sleep -Seconds 5
-                  $retries++
-              }
-          }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after $retries attempts. Exiting."
-              exit 1
-          }
-          
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+    - name: Verify RDP Accessibility via Tailscale
+      shell: powershell
+      run: |
+        Write-Host "🔍 Testing RDP connectivity via Tailscale..."
+        
+        # Test local RDP port
+        $rdpTest = Test-NetConnection -ComputerName localhost -Port 3389 -InformationLevel Quiet
+        
+        if (-not $rdpTest) {
+            Write-Warning "⚠️ Local RDP port not accessible, trying to fix..."
+            # Enable RDP again
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+            Restart-Service TermService -Force
+            Start-Sleep -Seconds 10
+        }
+        
+        # Display Tailscale status
+        Write-Host "✅ Tailscale Status:"
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+        
+        Write-Host "✅ RDP is ready via Tailscale"
 
-      - name: Prepare for Emulator Installation
-        shell: pwsh
-        run: |
-          Write-Host "Setting up environment for emulators..."
-          
-          # Create directory for emulators
-          New-Item -ItemType Directory -Path "C:\Emulators" -Force | Out-Null
-          
-          # Download common emulator tools
-          Write-Host "Downloading useful emulator tools..."
-          
-          # Download and install BlueStacks prerequisites
-          try {
-              # Install Windows SDK (useful for emulators)
-              Add-WindowsCapability -Online -Name "Windows.DeveloperMode~~~~0.0.1.0" -ErrorAction SilentlyContinue
-              
-              # Enable Developer Mode
-              Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
-                               -Name "AllowDevelopmentWithoutDevLicense" -Value 1 -Type DWord
-              Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" `
-                               -Name "AllowAllTrustedApps" -Value 1 -Type DWord
-              
-              Write-Host "Developer mode enabled for emulators"
-          } catch {
-              Write-Warning "Could not enable developer mode"
-          }
-          
-          # Set performance power plan
-          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High performance
-          
-          # Disable Windows Defender for better performance (temporarily)
-          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+    - name: Display Connection Information
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host "                 📱 ANDROID EMULATOR RDP                    " -ForegroundColor Yellow
+        Write-Host "                    (via Tailscale VPN)                     " -ForegroundColor Green
+        Write-Host "════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "🌐 CONNECT VIA RDP:" -ForegroundColor White
+        Write-Host "   Address: $env:TAILSCALE_IP" -ForegroundColor Green
+        Write-Host "   Username: $env:RDP_USER" -ForegroundColor Green
+        Write-Host "   Password: $env:RDP_PASSWORD" -ForegroundColor Green
+        Write-Host "   Port: 3389" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "📱 SELECTED EMULATOR: ${{ github.event.inputs.emulator_type }}" -ForegroundColor Magenta
+        Write-Host ""
+        Write-Host "🚀 AFTER CONNECTING:" -ForegroundColor Yellow
+        Write-Host "   1. Desktop पर 'Install Android Emulator' shortcut पर click करें"
+        Write-Host "   2. अपना preferred emulator select करें"
+        Write-Host "   3. Installation complete होने तक wait करें"
+        Write-Host "   4. Emulator open करें और अपने apps install करें"
+        Write-Host ""
+        Write-Host "⚙️ RECOMMENDED SETTINGS:" -ForegroundColor White
+        Write-Host "   • Graphics Mode: DirectX" -ForegroundColor Gray
+        Write-Host "   • Resolution: 1280x720" -ForegroundColor Gray
+        Write-Host "   • RAM: 2GB" -ForegroundColor Gray
+        Write-Host "   • CPU Cores: 2" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "ℹ️  IMPORTANT NOTES:" -ForegroundColor Cyan
+        Write-Host "   • यह GitHub Actions Windows runner पर चल रहा है" -ForegroundColor White
+        Write-Host "   • Tailscale VPN के through secure connection है" -ForegroundColor White
+        Write-Host "   • Session 6 घंटे तक active रहेगा" -ForegroundColor White
+        Write-Host "   • Lightweight apps/games best work करेंगे" -ForegroundColor White
+        Write-Host ""
+        Write-Host "🔗 TAILSCALE INFO:" -ForegroundColor Magenta
+        Write-Host "   • Hostname: github-android-$env:GITHUB_RUN_ID" -ForegroundColor Gray
+        Write-Host "   • IP: $env:TAILSCALE_IP" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+        Write-Host ""
+        
+        # Save info to file
+        $info = @"
+ANDROID EMULATOR RDP - Connection Details
+==========================================
+Tailscale RDP Address: $env:TAILSCALE_IP:3389
+Username: $env:RDP_USER
+Password: $env:RDP_PASSWORD
 
-      - name: Display Emulator-Ready Information
-        shell: pwsh
-        run: |
-          Write-Host ""
-          Write-Host "=== EMULATOR RDP READY ===" -ForegroundColor Green
-          Write-Host "Tailscale Address: $env:TAILSCALE_IP" -ForegroundColor Yellow
-          Write-Host "Username: $env:RDP_USER" -ForegroundColor Yellow
-          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Yellow
-          Write-Host "Port: 3389" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "=== INSTALL THESE EMULATORS ===" -ForegroundColor Cyan
-          Write-Host "1. BlueStacks 5: https://www.bluestacks.com/download.html"
-          Write-Host "2. NoxPlayer: https://www.bignox.com/"
-          Write-Host "3. LDPlayer: https://www.ldplayer.net/"
-          Write-Host "4. MEmu Play: https://www.memuplay.com/"
-          Write-Host "5. GameLoop: https://www.gameloop.com/"
-          Write-Host ""
-          Write-Host "=== OPTIMIZATION TIPS ===" -ForegroundColor Magenta
-          Write-Host "- Set emulator to DirectX mode"
-          Write-Host "- Allocate 4GB+ RAM to emulator"
-          Write-Host "- Enable VT in emulator settings"
-          Write-Host "- Use 1280x720 resolution for best performance"
-          Write-Host "=============================" -ForegroundColor Green
-          Write-Host ""
-          Write-Host "This session will be active for 6 hours"
-          Write-Host "Install your preferred emulator after connecting"
-          Write-Host ""
+Selected Emulator: ${{ github.event.inputs.emulator_type }}
 
-      - name: Maintain Connection
-        shell: pwsh
-        run: |
-          Write-Host "Maintaining RDP connection for emulator usage..."
-          Write-Host "Connect and install your preferred Android emulator"
-          
-          $startTime = Get-Date
-          $timeoutMinutes = 350
-          
-          while ($true) {
-              $elapsed = (Get-Date) - $startTime
-              $remaining = $timeoutMinutes - $elapsed.TotalMinutes
-              
-              if ($remaining -le 0) {
-                  Write-Host "Timeout reached. Stopping RDP session."
-                  break
-              }
-              
-              Write-Host "Emulator RDP active - Remaining: $([math]::Round($remaining)) minutes"
-              
-              # Check Tailscale connection
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
-              if (-not $tsStatus -or $tsStatus.BackendState -ne "Running") {
-                  Write-Error "Tailscale connection lost. Exiting."
-                  exit 1
-              }
-              
-              Start-Sleep -Seconds 60
-          }
+How to Connect:
+1. Install Tailscale on your local machine
+2. Login to your Tailscale account
+3. Open Windows Remote Desktop Connection
+4. Enter: $env:TAILSCALE_IP
+5. Username: $env:RDP_USER
+6. Password: $env:RDP_PASSWORD
+
+After Connecting:
+1. Run 'Install Android Emulator' from Desktop
+2. Select your preferred emulator
+3. Configure settings as recommended
+4. Install and use Android apps
+
+Notes:
+- Session will auto-terminate after 6 hours
+- Save your work frequently
+- Use recommended settings for best performance
+"@
+        
+        $info | Out-File -FilePath "C:\RDP_Info.txt" -Encoding ASCII
+
+    - name: Keep RDP Session Active
+      shell: powershell
+      run: |
+        Write-Host "🔄 Keeping RDP session active via Tailscale..."
+        
+        $startTime = Get-Date
+        $maxMinutes = 350
+        
+        while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            $minutes = [math]::Round($elapsed.TotalMinutes)
+            $remaining = $maxMinutes - $minutes
+            
+            if ($remaining -le 0) {
+                Write-Host "⏰ Time's up! RDP session ending."
+                break
+            }
+            
+            # Display status every 5 minutes
+            if ($minutes % 5 -eq 0) {
+                Write-Host "⏳ RDP active via Tailscale - $minutes minutes elapsed ($remaining minutes remaining)"
+                
+                # Verify Tailscale connection
+                try {
+                    $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                    
+                    if ($tsStatus.BackendState -ne "Running") {
+                        Write-Host "⚠️ Tailscale disconnected, reconnecting..."
+                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+                    }
+                    
+                    # Verify RDP service
+                    $rdpService = Get-Service TermService
+                    if ($rdpService.Status -ne "Running") {
+                        Write-Host "⚠️ RDP service stopped, restarting..."
+                        Start-Service TermService
+                    }
+                } catch {
+                    Write-Host "⚠️ Error checking services: $_"
+                }
+            }
+            
+            # Keep system active
+            $null = Get-Date
+            
+            Start-Sleep -Seconds 60
+        }
