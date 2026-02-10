@@ -1,0 +1,190 @@
+name: Duranto RDP with Tailscale & 64-bit Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService -Force
+
+      - name: Create User
+        shell: pwsh
+        run: |
+          $password = "Gaming@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Gamer" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Gamer"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Gamer"
+          echo "RDP_USER=Gamer" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Prerequisites
+        shell: pwsh
+        run: |
+          Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart
+          Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -NoRestart
+          bcdedit /set hypervisorlaunchtype auto
+          
+          # Visual C++
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          $vcInstaller = "$env:TEMP\vc_redist.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile $vcInstaller
+          Start-Process $vcInstaller -ArgumentList "/install", "/quiet", "/norestart" -Wait
+          
+          # DirectX
+          $dxUrl = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
+          $dxInstaller = "$env:TEMP\directx.exe"
+          Invoke-WebRequest -Uri $dxUrl -OutFile $dxInstaller
+          Start-Process $dxInstaller -ArgumentList "/Q", "/T:C:\DX" -Wait
+          Start-Process "C:\DX\DXSETUP.exe" -ArgumentList "/silent" -Wait
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Start-Sleep -Seconds 15
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Host "Tailscale auth key not found, skipping..."
+              echo "TAILSCALE_IP=LOCAL" >> $env:GITHUB_ENV
+          } else {
+              # Start Tailscale service
+              Start-Service Tailscale -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 10
+              
+              # Connect with auth key
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=github-rdp-bs5
+              
+              # Get Tailscale IP
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              Write-Host "Tailscale IP: $tsIP"
+          }
+
+      - name: Install BlueStacks 5
+        shell: pwsh
+        run: |
+          Write-Host "Installing BlueStacks 5 64-bit..."
+          
+          # Method 1: Direct download
+          $bsUrl = "https://cdn3.bluestacks.com/downloads/5.11.210.1002/BlueStacksMicroInstaller_5.11.210.1002_native.exe"
+          $installer = "$env:TEMP\BlueStacks.exe"
+          
+          Invoke-WebRequest -Uri $bsUrl -OutFile $installer -TimeoutSec 300
+          
+          # Silent install
+          Start-Process $installer -ArgumentList "/silent", "/S" -Wait -NoNewWindow
+          Start-Sleep -Seconds 120
+          
+          # Alternative if above fails
+          if (-not (Test-Path "$env:ProgramFiles\BlueStacks_nxt\HD-Player.exe")) {
+              Write-Host "Trying alternative installer..."
+              $altUrl = "https://www.bluestacks.com/download.html?utm_source=download&utm_medium=website&utm_campaign=download"
+              $altInstaller = "$env:TEMP\BlueStacks_alt.exe"
+              Invoke-WebRequest -Uri $altUrl -OutFile $altInstaller -UserAgent "Mozilla/5.0"
+              Start-Process $altInstaller -ArgumentList "/silent" -Wait
+              Start-Sleep -Seconds 90
+          }
+
+      - name: Configure BlueStacks
+        shell: pwsh
+        run: |
+          # Create config file
+          $configContent = @"
+bst.installed_images = "AndroidP64"
+bst.instance.Nougat64.enable = 1
+bst.instance.Nougat32.enable = 0
+engine.renderer = "software"
+performance.cpu = "4"
+performance.ram = "4096"
+bst.display_settings = "1280x720"
+"@
+          
+          $configPath = "$env:ProgramFiles\BlueStacks_nxt\bluestacks.conf"
+          Set-Content -Path $configPath -Value $configContent -Force
+          
+          # Create shortcut
+          $shortcutPath = "$env:PUBLIC\Desktop\BlueStacks 5.lnk"
+          $targetPath = "$env:ProgramFiles\BlueStacks_nxt\HD-Player.exe"
+          
+          $WshShell = New-Object -ComObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut($shortcutPath)
+          $Shortcut.TargetPath = $targetPath
+          $Shortcut.Arguments = "--software"
+          $Shortcut.Save()
+
+      - name: Setup Complete Display
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "==============================================" -ForegroundColor Green
+          Write-Host "           SETUP COMPLETE" -ForegroundColor Yellow
+          Write-Host "==============================================" -ForegroundColor Green
+          
+          if ($env:TAILSCALE_IP -ne "LOCAL") {
+              Write-Host "Tailscale Address: $env:TAILSCALE_IP" -ForegroundColor Cyan
+          } else {
+              Write-Host "Tailscale: Not configured (add TAILSCALE_AUTH_KEY to secrets)" -ForegroundColor Yellow
+          }
+          
+          Write-Host "Username: $env:RDP_USER" -ForegroundColor White
+          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor White
+          Write-Host ""
+          Write-Host "BlueStacks 5 (64-bit) installed on Desktop" -ForegroundColor Green
+          Write-Host "First launch may take 2-3 minutes" -ForegroundColor Yellow
+          Write-Host "Use software rendering mode" -ForegroundColor Yellow
+          Write-Host "==============================================" -ForegroundColor Green
+          Write-Host ""
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          Write-Host "Session active for 6 hours..."
+          $startTime = Get-Date
+          $timeout = 350
+          
+          # Check Tailscale connection periodically
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = $timeout - $elapsed.TotalMinutes
+              
+              if ($remaining -le 0) {
+                  Write-Host "Session timeout reached"
+                  break
+              }
+              
+              # Display status every 5 minutes
+              if ([math]::Round($elapsed.TotalSeconds) % 300 -eq 0) {
+                  Write-Host "Active - Remaining: $([math]::Round($remaining)) minutes"
+                  
+                  # Check Tailscale if configured
+                  if ($env:TAILSCALE_IP -ne "LOCAL") {
+                      $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+                      if ($tsStatus -like "*Active*") {
+                          Write-Host "Tailscale: Connected" -ForegroundColor Green
+                      } else {
+                          Write-Host "Tailscale: Disconnected" -ForegroundColor Red
+                      }
+                  }
+              }
+              
+              Start-Sleep -Seconds 30
+          }
