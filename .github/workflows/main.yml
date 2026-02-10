@@ -1,0 +1,298 @@
+name: Duranto RDP with 64-bit Emulator
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService -Force
+
+      - name: Create User
+        shell: pwsh
+        run: |
+          $password = "Gaming@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "Gamer" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "Gamer"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Gamer"
+          echo "RDP_USER=Gamer" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Prerequisites for 64-bit Emulator
+        shell: pwsh
+        run: |
+          Write-Host "Installing prerequisites for 64-bit Android emulator..."
+          
+          # Windows Hypervisor Platform enable करें
+          Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart
+          Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -NoRestart
+          
+          # Virtualization features enable करें
+          bcdedit /set hypervisorlaunchtype auto
+          
+          # Latest Visual C++ Redistributables
+          $vcUrls = @(
+              "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+              "https://download.visualstudio.microsoft.com/download/pr/8b92f460-7e03-4c75-a139-e264a770758d/26B2F7C2CAEDD6C4B7D5A5A6E6D6C5A9EC9E9D8A7/VC_redist.x64.exe"
+          )
+          
+          foreach ($url in $vcUrls) {
+              $installer = "$env:TEMP\vc_redist_$((Get-Random).ToString()).exe"
+              Invoke-WebRequest -Uri $url -OutFile $installer
+              Start-Process $installer -ArgumentList "/install", "/quiet", "/norestart" -Wait -NoNewWindow
+              Start-Sleep -Seconds 5
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          }
+          
+          # DirectX End-User Runtime
+          $dxUrl = "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe"
+          $dxInstaller = "$env:TEMP\directx.exe"
+          Invoke-WebRequest -Uri $dxUrl -OutFile $dxInstaller
+          Start-Process $dxInstaller -ArgumentList "/Q", "/T:C:\DX" -Wait
+          Start-Process "C:\DX\DXSETUP.exe" -ArgumentList "/silent" -Wait
+
+      - name: Install BlueStacks 5 64-bit (Nougat 64)
+        shell: pwsh
+        run: |
+          Write-Host "Downloading BlueStacks 5 64-bit..."
+          
+          # BlueStacks 5 with Nougat 64-bit support
+          $bsUrl = "https://cdn3.bluestacks.com/downloads/5.11.210.1002/BlueStacksMicroInstaller_5.11.210.1002_native.exe"
+          $installer = "$env:TEMP\BlueStacks64.exe"
+          
+          Invoke-WebRequest -Uri $bsUrl -OutFile $installer -TimeoutSec 300
+          
+          Write-Host "Installing BlueStacks 5 64-bit (This may take 10-15 minutes)..."
+          
+          # Silent install with 64-bit instance
+          $installArgs = @(
+              "/silent",
+              "/S",
+              "/InstallationType=PERSONAL",
+              "/NoShortcuts"
+          )
+          
+          Start-Process $installer -ArgumentList $installArgs -Wait -NoNewWindow
+          
+          # Wait longer for complete installation
+          Start-Sleep -Seconds 180
+          
+          Write-Host "BlueStacks installation complete!"
+
+      - name: Configure BlueStacks for 64-bit Performance
+        shell: pwsh
+        run: |
+          Write-Host "Configuring BlueStacks 5 for 64-bit Android..."
+          
+          # BlueStacks configuration file path
+          $bsConfigPath = "$env:ProgramFiles\BlueStacks_nxt\bluestacks.conf"
+          
+          # 64-bit specific configuration
+          $bsConfig = @"
+bst.installed_images = "AndroidP64"
+bst.instance.Nougat64.enable = 1
+bst.instance.Nougat32.enable = 0
+bst.instance.Pie64.enable = 0
+bst.instance.Android11.enable = 0
+engine.renderer = "software"
+bst.feature.rooting = "0"
+bst.mode = "performance"
+performance.cpu = "4"
+performance.ram = "6144"
+bst.display_settings = "1280x720@240"
+bst.launch_options = "--disable-gpu-sandbox"
+bst.gpu_settings = "renderer=software"
+bst.adb_port = "5555"
+"@
+          
+          # Create or overwrite config file
+          Set-Content -Path $bsConfigPath -Value $bsConfig -Force
+          
+          # Additional registry tweaks for 64-bit
+          $registryPath = "HKCU:\Software\BlueStacks"
+          New-Item -Path $registryPath -Force | Out-Null
+          Set-ItemProperty -Path $registryPath -Name "GuestHeight" -Value 720 -Type DWord
+          Set-ItemProperty -Path $registryPath -Name "GuestWidth" -Value 1280 -Type DWord
+          Set-ItemProperty -Path $registryPath -Name "FPS" -Value 30 -Type DWord
+          Set-ItemProperty -Path $registryPath -Name "EnableHighFPS" -Value 1 -Type DWord
+          
+          Write-Host "64-bit configuration applied!"
+
+      - name: Install Android x86_64 System Image
+        shell: pwsh
+        run: |
+          Write-Host "Preparing Android 64-bit system image..."
+          
+          # Create BlueStacks data directory
+          $bsDataDir = "C:\ProgramData\BlueStacks_nxt\Engine"
+          New-Item -Path $bsDataDir -ItemType Directory -Force | Out-Null
+          
+          # Download Nougat 64-bit system image
+          $imageUrl = "https://dl.google.com/android/repository/sys-img/google_apis/x86_64-29_r10.zip"
+          $imageZip = "$env:TEMP\android_x86_64.zip"
+          $extractPath = "$bsDataDir\Nougat64"
+          
+          Write-Host "Downloading Android x86_64 system image..."
+          Invoke-WebRequest -Uri $imageUrl -OutFile $imageZip -TimeoutSec 600
+          
+          Write-Host "Extracting system image..."
+          Expand-Archive -Path $imageZip -DestinationPath $extractPath -Force
+          
+          # Configure the instance
+          $instanceConfig = @"
+avd.ini.encoding=UTF-8
+PlayStore.enabled=true
+abi.type=x86_64
+avd.name=Nougat64
+disk.dataPartition.size=8G
+hw.accelerometer=yes
+hw.audioInput=yes
+hw.battery=yes
+hw.camera.back=virtualscene
+hw.camera.front=emulated
+hw.cpu.arch=x86_64
+hw.cpu.ncore=4
+hw.dPad=yes
+hw.gps=yes
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader
+hw.keyboard=yes
+hw.lcd.density=240
+hw.mainKeys=no
+hw.ramSize=6144
+hw.sdCard=yes
+hw.sensors.orientation=yes
+hw.sensors.proximity=yes
+image.sysdir.1=system-images\android-29\google_apis\x86_64\
+sdcard.size=4G
+skin.name=720x1280
+tag.display=Google APIs
+tag.id=google_apis
+vm.heapSize=512
+"@
+          
+          $configPath = "$extractPath\config.ini"
+          Set-Content -Path $configPath -Value $instanceConfig -Force
+
+      - name: Create BlueStacks Shortcut and Setup
+        shell: pwsh
+        run: |
+          Write-Host "Creating shortcuts and final setup..."
+          
+          # Desktop shortcut for BlueStacks with 64-bit instance
+          $shortcutPath = "$env:PUBLIC\Desktop\BlueStacks 5 (64-bit).lnk"
+          $targetPath = "$env:ProgramFiles\BlueStacks_nxt\HD-Player.exe"
+          
+          $WshShell = New-Object -ComObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut($shortcutPath)
+          $Shortcut.TargetPath = $targetPath
+          $Shortcut.Arguments = "--instance Nougat64 --software"
+          $Shortcut.WorkingDirectory = "$env:ProgramFiles\BlueStacks_nxt"
+          $Shortcut.IconLocation = "$env:ProgramFiles\BlueStacks_nxt\HD-Icon.ico"
+          $Shortcut.Description = "BlueStacks 5 Android 64-bit Emulator"
+          $Shortcut.Save()
+          
+          # Create batch file for easy launch
+          $batchContent = @"
+@echo off
+cd /d "C:\Program Files\BlueStacks_nxt"
+start HD-Player.exe --instance Nougat64 --software --vm-name Nougat64
+timeout /t 30
+echo BlueStacks 64-bit is starting...
+"@
+          
+          Set-Content -Path "$env:PUBLIC\Desktop\Start BlueStacks.bat" -Value $batchContent
+          
+          Write-Host "Shortcuts created on Public Desktop"
+
+      - name: Install GPU Compatibility Layer
+        shell: pwsh
+        run: |
+          Write-Host "Installing compatibility layers for better graphics..."
+          
+          # Mesa3D for software rendering
+          $mesaUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/22.3.3/mesa3d-22.3.3-release-msvc.7z"
+          $mesaZip = "$env:TEMP\mesa3d.7z"
+          $mesaPath = "C:\Mesa3D"
+          
+          # Download 7-Zip if not present
+          if (-not (Test-Path "$env:ProgramFiles\7-Zip\7z.exe")) {
+              $7zUrl = "https://www.7-zip.org/a/7z2201-x64.exe"
+              $7zInstaller = "$env:TEMP\7z.exe"
+              Invoke-WebRequest -Uri $7zUrl -OutFile $7zInstaller
+              Start-Process $7zInstaller -ArgumentList "/S", "/D=$env:ProgramFiles\7-Zip" -Wait
+          }
+          
+          Invoke-WebRequest -Uri $mesaUrl -OutFile $mesaZip
+          & "$env:ProgramFiles\7-Zip\7z.exe" x $mesaZip -o"$mesaPath" -y
+          
+          # Set OpenGL software rendering
+          [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.6", "Machine")
+          [Environment]::SetEnvironmentVariable("MESA_GLSL_VERSION_OVERRIDE", "460", "Machine")
+          [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+
+      - name: Test BlueStacks Installation
+        shell: pwsh
+        run: |
+          Write-Host "Testing BlueStacks 64-bit installation..."
+          
+          # First launch to initialize
+          $bsExe = "$env:ProgramFiles\BlueStacks_nxt\HD-Player.exe"
+          if (Test-Path $bsExe) {
+              Write-Host "Starting BlueStacks for first-time setup..."
+              Start-Process $bsExe -ArgumentList "--instance", "Nougat64", "--software" -NoNewWindow
+              
+              # Wait for initialization
+              Start-Sleep -Seconds 60
+              
+              # Kill process to continue
+              Get-Process | Where-Object {$_.ProcessName -like "*BlueStacks*"} | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          
+          Write-Host "BlueStacks 64-bit installation complete!"
+          Write-Host "Note: First launch may take 2-3 minutes to initialize Android"
+
+      - name: Display Connection Info
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== ANDROID 64-BIT EMULATOR READY ===" -ForegroundColor Green
+          Write-Host "Username: $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "After RDP login:" -ForegroundColor Cyan
+          Write-Host "1. Open BlueStacks 5 (64-bit) from Desktop" -ForegroundColor White
+          Write-Host "2. First boot may take 3-5 minutes" -ForegroundColor White
+          Write-Host "3. Use software rendering mode" -ForegroundColor White
+          Write-Host "4. RAM: 6GB allocated | CPU: 4 cores" -ForegroundColor White
+          Write-Host "=====================================" -ForegroundColor Green
+          Write-Host ""
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "RDP session active for 6 hours..."
+          $startTime = Get-Date
+          $timeout = 350
+          
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = $timeout - $elapsed.TotalMinutes
+              
+              if ($remaining -le 0) {
+                  Write-Host "Session timeout reached"
+                  break
+              }
+              
+              Write-Host "Active - Remaining: $([math]::Round($remaining)) minutes"
+              Start-Sleep -Seconds 60
+          }
